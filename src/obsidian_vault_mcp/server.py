@@ -35,8 +35,9 @@ async def lifespan(server):
 # Create the MCP server
 mcp = FastMCP(
     "obsidian_web_mcp",
-    stateless_http=True,
+    stateless_http=False,
     json_response=True,
+    streamable_http_path="/",
     lifespan=lifespan,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -44,8 +45,7 @@ mcp = FastMCP(
             "127.0.0.1:*",
             "localhost:*",
             "[::1]:*",
-            # Add your tunnel hostname here, e.g.:
-            # "vault-mcp.example.com",
+            "vault-mcp.joehtoo.dev",
         ],
     ),
 )
@@ -54,12 +54,13 @@ mcp = FastMCP(
 # --- Register all tools ---
 
 from .tools.read import vault_read as _vault_read, vault_batch_read as _vault_batch_read
-from .tools.write import vault_write as _vault_write, vault_batch_frontmatter_update as _vault_batch_frontmatter_update
+from .tools.write import vault_write as _vault_write, vault_edit as _vault_edit, vault_batch_frontmatter_update as _vault_batch_frontmatter_update
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
 from .models import (
     VaultReadInput,
     VaultWriteInput,
+    VaultEditInput,
     VaultBatchReadInput,
     VaultBatchFrontmatterUpdateInput,
     VaultSearchInput,
@@ -101,6 +102,17 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
     """Write a file to the vault."""
     inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
     return _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter)
+
+
+@mcp.tool(
+    name="vault_edit",
+    description="Edit an existing vault file by replacing old_string with new_string. By default old_string must match EXACTLY ONCE -- pass replace_all=true to replace every occurrence. Atomic write; safe alongside Obsidian Sync. Cannot create new files (use vault_write).",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_edit(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Find-and-replace edit on a vault file."""
+    inp = VaultEditInput(path=path, old_string=old_string, new_string=new_string, replace_all=replace_all)
+    return _vault_edit(inp.path, inp.old_string, inp.new_string, inp.replace_all)
 
 
 @mcp.tool(
@@ -150,7 +162,7 @@ def vault_search_frontmatter(
 
 @mcp.tool(
     name="vault_list",
-    description="List directory contents in the vault. Supports recursion depth, file/dir filtering, and glob patterns. Excludes .obsidian, .trash, .git directories.",
+    description="List directory contents in the vault. Supports recursion depth, file/dir filtering, and glob patterns. Excludes .obsidian, .trash, .git directories, plus any configured via EXCLUDED_DIRS_EXTRA.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def vault_list(

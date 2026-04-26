@@ -19,7 +19,13 @@ MAX_LIST_DEPTH = 5            # Max directory recursion depth
 CONTEXT_LINES = 2             # Default lines of context in search results
 
 # Directories to never expose or modify
-EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store"}
+# Built-in exclusions (always applied) + user-configured extras via EXCLUDED_DIRS_EXTRA env var
+# Example: EXCLUDED_DIRS_EXTRA="day-one-archive,transcripts,incoming"
+_BUILTIN_EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store"}
+_EXTRA_EXCLUDED_DIRS = {
+    d.strip() for d in os.environ.get("EXCLUDED_DIRS_EXTRA", "").split(",") if d.strip()
+}
+EXCLUDED_DIRS = _BUILTIN_EXCLUDED_DIRS | _EXTRA_EXCLUDED_DIRS
 
 # Frontmatter index refresh interval (seconds)
 FRONTMATTER_INDEX_DEBOUNCE = 5.0

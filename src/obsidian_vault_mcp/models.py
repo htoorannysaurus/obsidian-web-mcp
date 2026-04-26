@@ -53,6 +53,34 @@ class VaultWriteInput(BaseModel):
     )
 
 
+class VaultEditInput(BaseModel):
+    """Find-and-replace edit on an existing vault file."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    old_string: str = Field(
+        ...,
+        description="Exact text to find. Must appear exactly once unless replace_all=true.",
+        min_length=1,
+        max_length=MAX_CONTENT_SIZE,
+    )
+    new_string: str = Field(
+        ...,
+        description="Replacement text. Pass empty string to delete the match.",
+        max_length=MAX_CONTENT_SIZE,
+    )
+    replace_all: bool = Field(
+        default=False,
+        description="If true, replace every occurrence of old_string. Default false (single-match enforcement).",
+    )
+
+
 class VaultListInput(BaseModel):
     """List files and directories under a vault path."""
 

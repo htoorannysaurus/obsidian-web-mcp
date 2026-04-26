@@ -26,6 +26,10 @@ def resolve_vault_path(relative_path: str) -> Path:
             raise ValueError(
                 f"Path component '{part}' starts with '.'; dotfiles and hidden directories are not allowed"
             )
+        if part in config.EXCLUDED_DIRS:
+            raise ValueError(
+                f"Path component '{part}' is in EXCLUDED_DIRS and cannot be accessed"
+            )
 
     resolved = (config.VAULT_PATH / relative_path).resolve()
     vault_root = config.VAULT_PATH.resolve()

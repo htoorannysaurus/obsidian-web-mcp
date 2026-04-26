@@ -41,6 +41,57 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
         return json.dumps({"error": str(e), "path": path})
 
 
+def vault_edit(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Edit a file by replacing old_string with new_string.
+
+    Default semantics (replace_all=False): old_string must appear EXACTLY once,
+    otherwise the edit is rejected with an error -- this protects against
+    accidental ambiguous matches when editing from a phone or web client.
+    Use replace_all=True to replace every occurrence.
+    """
+    try:
+        resolve_vault_path(path)
+
+        try:
+            existing_content, _ = read_file(path)
+        except FileNotFoundError:
+            return json.dumps({"error": "File not found", "path": path})
+
+        if old_string == new_string:
+            return json.dumps({"error": "old_string and new_string are identical", "path": path})
+
+        if old_string == "":
+            return json.dumps({"error": "old_string cannot be empty (use vault_write to create a file)", "path": path})
+
+        occurrences = existing_content.count(old_string)
+
+        if occurrences == 0:
+            return json.dumps({"error": "old_string not found in file", "path": path, "occurrences": 0})
+
+        if not replace_all and occurrences > 1:
+            return json.dumps({
+                "error": f"old_string found {occurrences} times; pass replace_all=true or include more surrounding context to make the match unique",
+                "path": path,
+                "occurrences": occurrences,
+            })
+
+        if replace_all:
+            new_content = existing_content.replace(old_string, new_string)
+            replaced = occurrences
+        else:
+            new_content = existing_content.replace(old_string, new_string, 1)
+            replaced = 1
+
+        _, size = write_file_atomic(path, new_content, create_dirs=False)
+
+        return json.dumps({"path": path, "replacements": replaced, "size": size})
+    except ValueError as e:
+        return json.dumps({"error": str(e), "path": path})
+    except Exception as e:
+        logger.error(f"vault_edit error for {path}: {e}")
+        return json.dumps({"error": str(e), "path": path})
+
+
 def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     """Update frontmatter fields on multiple files without changing body content."""
     results = []
