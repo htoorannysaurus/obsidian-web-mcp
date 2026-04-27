@@ -23,13 +23,13 @@ frontmatter_index = FrontmatterIndex()
 
 @asynccontextmanager
 async def lifespan(server):
-    """Start frontmatter index on server startup, stop on shutdown."""
-    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
-    frontmatter_index.start()
-    logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
+    """Per-session lifespan. Index is started once in main() at process startup,
+    not here -- FastMCP invokes this per MCP session, and re-indexing 3000+
+    files on every claude.ai connection caused 60s+ tool-list timeouts.
+    """
+    logger.debug(f"MCP session opened. Vault: {VAULT_PATH}")
     yield {"frontmatter_index": frontmatter_index}
-    frontmatter_index.stop()
-    logger.info("Vault MCP server shut down.")
+    logger.debug("MCP session closed.")
 
 
 # Create the MCP server
@@ -213,6 +213,13 @@ def main():
 
     if not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
+
+    # Build the frontmatter index ONCE at process startup. Doing this here
+    # (instead of in lifespan) ensures the cost is paid once, not per MCP
+    # session -- otherwise claude.ai's tool-list registration times out.
+    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
+    frontmatter_index.start()
+    logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
 
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:
