@@ -1,6 +1,7 @@
 """Core filesystem operations for the Obsidian vault."""
 
 import fnmatch
+import hashlib
 import os
 import shutil
 import tempfile
@@ -34,7 +35,10 @@ def resolve_vault_path(relative_path: str) -> Path:
     resolved = (config.VAULT_PATH / relative_path).resolve()
     vault_root = config.VAULT_PATH.resolve()
 
-    if not str(resolved).startswith(str(vault_root) + os.sep) and resolved != vault_root:
+    if (
+        not str(resolved).startswith(str(vault_root) + os.sep)
+        and resolved != vault_root
+    ):
         raise ValueError("Path resolves outside the vault root")
 
     return resolved
@@ -43,6 +47,30 @@ def resolve_vault_path(relative_path: str) -> Path:
 def _iso_timestamp(ts: float) -> str:
     """Convert a Unix timestamp to an ISO 8601 string in UTC."""
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def content_revision(content: str) -> str:
+    """Return a stable revision identifier for optimistic concurrency checks."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def metadata_from_stat(stat: os.stat_result) -> dict:
+    """Build JSON-safe metadata from an existing stat result."""
+    return {
+        "size": stat.st_size,
+        "modified": _iso_timestamp(stat.st_mtime),
+        "created": _iso_timestamp(
+            stat.st_birthtime if hasattr(stat, "st_birthtime") else stat.st_ctime
+        ),
+    }
+
+
+def stat_file(relative_path: str) -> dict:
+    """Return file metadata without reading the file body."""
+    path = resolve_vault_path(relative_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Not a file: {relative_path}")
+    return metadata_from_stat(path.stat())
 
 
 def read_file(relative_path: str) -> tuple[str, dict]:
@@ -55,20 +83,18 @@ def read_file(relative_path: str) -> tuple[str, dict]:
     if not path.is_file():
         raise FileNotFoundError(f"Not a file: {relative_path}")
 
-    stat = path.stat()
     content = path.read_text(encoding="utf-8")
-
-    metadata = {
-        "size": stat.st_size,
-        "modified": _iso_timestamp(stat.st_mtime),
-        "created": _iso_timestamp(stat.st_birthtime if hasattr(stat, "st_birthtime") else stat.st_ctime),
-    }
+    metadata = stat_file(relative_path)
+    metadata["revision"] = content_revision(content)
 
     return content, metadata
 
 
 def write_file_atomic(
-    relative_path: str, content: str, create_dirs: bool = True
+    relative_path: str,
+    content: str,
+    create_dirs: bool = True,
+    expected_revision: str | None = None,
 ) -> tuple[bool, int]:
     """Write content to a file atomically.
 
@@ -84,6 +110,16 @@ def write_file_atomic(
     path = resolve_vault_path(relative_path)
     is_new = not path.exists()
 
+    if expected_revision is not None:
+        if is_new:
+            raise ValueError("Revision mismatch: file does not exist")
+        current_content = path.read_text(encoding="utf-8")
+        current_revision = content_revision(current_content)
+        if current_revision != expected_revision:
+            raise ValueError(
+                "Revision mismatch: file changed since it was read; read it again before writing"
+            )
+
     if create_dirs:
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -92,6 +128,12 @@ def write_file_atomic(
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(encoded)
+        if expected_revision is not None:
+            current_content = path.read_text(encoding="utf-8")
+            if content_revision(current_content) != expected_revision:
+                raise ValueError(
+                    "Revision mismatch: file changed while the update was being prepared"
+                )
         os.replace(tmp_path, path)
     except BaseException:
         # Clean up the temp file on any failure
@@ -104,9 +146,7 @@ def write_file_atomic(
     return is_new, len(encoded)
 
 
-def move_path(
-    source: str, destination: str, create_dirs: bool = True
-) -> bool:
+def move_path(source: str, destination: str, create_dirs: bool = True) -> bool:
     """Move a file or directory from source to destination.
 
     Both paths are relative to the vault root. Raises if the destination
@@ -187,7 +227,12 @@ def list_directory(
 
         for entry in entries:
             # Skip excluded directories at every level
-            if entry.name in config.EXCLUDED_DIRS:
+            if entry.name.startswith(".") or entry.name in config.EXCLUDED_DIRS:
+                continue
+
+            # Never expose or recurse through symlinks. A symlink inside the
+            # vault can otherwise point at arbitrary files outside the root.
+            if entry.is_symlink():
                 continue
 
             is_dir = entry.is_dir()
@@ -213,13 +258,15 @@ def list_directory(
 
             rel = str(entry.relative_to(vault_root))
 
-            results.append({
-                "name": entry.name,
-                "path": rel,
-                "type": "dir" if is_dir else "file",
-                "size": stat.st_size,
-                "modified": _iso_timestamp(stat.st_mtime),
-            })
+            results.append(
+                {
+                    "name": entry.name,
+                    "path": rel,
+                    "type": "dir" if is_dir else "file",
+                    "size": stat.st_size,
+                    "modified": _iso_timestamp(stat.st_mtime),
+                }
+            )
 
             if is_dir:
                 _walk(entry, current_depth + 1)

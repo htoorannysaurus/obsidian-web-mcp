@@ -1,7 +1,5 @@
 """Test fixtures for the Obsidian vault MCP server."""
 
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -33,12 +31,20 @@ def vault_dir(tmp_path, monkeypatch):
     obsidian_dir.mkdir()
     (obsidian_dir / "config.json").write_text('{"theme": "dark"}')
 
+    # Generic hidden content should also be excluded.
+    hidden_dir = vault / ".claude"
+    hidden_dir.mkdir()
+    (hidden_dir / "private.md").write_text("Hidden private content")
+
     # Set environment variable for config module
     monkeypatch.setenv("VAULT_PATH", str(vault))
     monkeypatch.setenv("VAULT_MCP_TOKEN", "test-token-12345")
 
     # Reload config to pick up new env var
     import obsidian_vault_mcp.config as config
-    config.VAULT_PATH = Path(str(vault))
+
+    monkeypatch.setattr(config, "VAULT_PATH", Path(str(vault)))
+    monkeypatch.setattr(config, "VAULT_MCP_TOKEN", "test-token-12345")
+    monkeypatch.setattr(config, "VAULT_BOOTSTRAP_FILE", "")
 
     yield vault

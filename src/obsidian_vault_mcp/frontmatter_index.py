@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import frontmatter
-from watchdog.events import FileSystemEvent, FileSystemEventHandler
+from watchdog.events import FileMovedEvent, FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from . import config
@@ -23,29 +23,29 @@ class FrontmatterIndex:
         self._observer: Observer | None = None
         self._debounce_timer: threading.Timer | None = None
         self._pending_paths: set[str] = set()
+        self._vault_path: Path | None = None
 
     def start(self) -> None:
         """Walk all .md files, parse frontmatter, and start watching for changes."""
         t0 = time.monotonic()
         count = 0
+        self._vault_path = config.VAULT_PATH.resolve()
 
-        for md_path in config.VAULT_PATH.rglob("*.md"):
+        for md_path in self._vault_path.rglob("*.md"):
             if self._is_excluded(md_path):
                 continue
-            rel = str(md_path.relative_to(config.VAULT_PATH))
+            rel = str(md_path.relative_to(self._vault_path))
             fm = self._parse_frontmatter(md_path)
             if fm is not None:
                 self._index[rel] = fm
                 count += 1
 
         elapsed = time.monotonic() - t0
-        logger.info(
-            "Frontmatter index built: %d files in %.2f seconds", count, elapsed
-        )
+        logger.info("Frontmatter index built: %d files in %.2f seconds", count, elapsed)
 
         self._observer = Observer()
         handler = _VaultEventHandler(self)
-        self._observer.schedule(handler, str(config.VAULT_PATH), recursive=True)
+        self._observer.schedule(handler, str(self._vault_path), recursive=True)
         self._observer.start()
 
     def stop(self) -> None:
@@ -90,18 +90,42 @@ class FrontmatterIndex:
                     if field in fm:
                         results.append({"path": rel_path, "frontmatter": fm})
                 elif match_type == "exact":
-                    if field in fm and str(fm[field]) == value:
-                        results.append({"path": rel_path, "frontmatter": fm})
+                    if field in fm:
+                        candidate = fm[field]
+                        if isinstance(candidate, (list, tuple, set)):
+                            matched = any(str(item) == value for item in candidate)
+                        else:
+                            matched = str(candidate) == value
+                        if matched:
+                            results.append({"path": rel_path, "frontmatter": fm})
                 elif match_type == "contains":
                     if field in fm and value.lower() in str(fm[field]).lower():
                         results.append({"path": rel_path, "frontmatter": fm})
         return results
 
+    def get(self, relative_path: str) -> dict | None:
+        """Return a copy of a file's indexed frontmatter, if available."""
+        with self._lock:
+            value = self._index.get(relative_path)
+            return dict(value) if value is not None else None
+
+    def snapshot(self) -> dict[str, dict]:
+        """Return a shallow copy of all indexed frontmatter."""
+        with self._lock:
+            return {path: dict(metadata) for path, metadata in self._index.items()}
+
     # -- Internal helpers --
 
     def _is_excluded(self, path: Path) -> bool:
         """Check whether any path component is in config.EXCLUDED_DIRS."""
-        return bool(config.EXCLUDED_DIRS & set(path.relative_to(config.VAULT_PATH).parts))
+        root = self._vault_path or config.VAULT_PATH.resolve()
+        try:
+            relative = path.resolve().relative_to(root)
+        except ValueError:
+            return True
+        return any(part.startswith(".") for part in relative.parts) or bool(
+            config.EXCLUDED_DIRS & set(relative.parts)
+        )
 
     def _parse_frontmatter(self, path: Path) -> dict | None:
         """Parse YAML frontmatter from a markdown file. Returns None on failure."""
@@ -132,7 +156,11 @@ class FrontmatterIndex:
 
         for abs_path_str in paths:
             abs_path = Path(abs_path_str)
-            rel = str(abs_path.relative_to(config.VAULT_PATH))
+            root = self._vault_path or config.VAULT_PATH.resolve()
+            try:
+                rel = str(abs_path.resolve().relative_to(root))
+            except ValueError:
+                continue
             if abs_path.exists():
                 fm = self._parse_frontmatter(abs_path)
                 with self._lock:
@@ -170,3 +198,11 @@ class _VaultEventHandler(FileSystemEventHandler):
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         self._handle(event)
+
+    def on_moved(self, event: FileMovedEvent) -> None:
+        # A move is both a deletion of the old path and creation of the new
+        # path. This also covers atomic temp-file replacements used by writes.
+        self._handle(event)
+        destination = Path(event.dest_path)
+        if destination.suffix == ".md" and not self._index._is_excluded(destination):
+            self._index._schedule_debounce(event.dest_path)

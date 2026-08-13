@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from .config import (
     CONTEXT_LINES,
@@ -24,6 +24,24 @@ class VaultReadInput(BaseModel):
         description="Relative path from vault root (e.g. 'projects/acme/notes.md')",
         min_length=1,
         max_length=500,
+    )
+    include_content: bool = Field(
+        default=True,
+        description="Return note content; false uses the metadata/frontmatter fast path",
+    )
+    body_only: bool = Field(
+        default=False,
+        description="Strip YAML frontmatter from returned content",
+    )
+    start_line: int = Field(default=1, ge=1, description="First content line to return")
+    max_lines: int | None = Field(
+        default=None, ge=1, le=10_000, description="Maximum content lines to return"
+    )
+    max_chars: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_CONTENT_SIZE,
+        description="Maximum content characters to return",
     )
 
 
@@ -50,6 +68,12 @@ class VaultWriteInput(BaseModel):
     merge_frontmatter: bool = Field(
         default=False,
         description="If true, merge YAML frontmatter with existing file's frontmatter instead of replacing",
+    )
+    expected_revision: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        description="Optional revision returned by vault_read; rejects stale overwrites",
     )
 
 
@@ -78,6 +102,36 @@ class VaultEditInput(BaseModel):
     replace_all: bool = Field(
         default=False,
         description="If true, replace every occurrence of old_string. Default false (single-match enforcement).",
+    )
+    expected_revision: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        description="Optional revision returned by vault_read; rejects stale edits",
+    )
+
+
+class VaultInsertInput(BaseModel):
+    """Incrementally insert content into an existing note."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., min_length=1, max_length=500)
+    content: str = Field(..., max_length=MAX_CONTENT_SIZE)
+    position: Literal["append", "prepend", "after_heading"] = Field(
+        default="append",
+        description="Where to insert content",
+    )
+    heading: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Exact Markdown heading line required for after_heading",
+    )
+    expected_revision: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        description="Optional revision returned by vault_read; rejects stale inserts",
     )
 
 
@@ -185,6 +239,10 @@ class VaultSearchInput(BaseModel):
         le=10,
         description="Number of lines of context to show around each match",
     )
+    regex: bool = Field(
+        default=False,
+        description="If true, treat query as a regular expression instead of literal text",
+    )
 
 
 class VaultSearchFrontmatterInput(BaseModel):
@@ -235,6 +293,27 @@ class VaultBatchReadInput(BaseModel):
         default=True,
         description="If false, return metadata only (frontmatter, size) without file body",
     )
+    max_chars: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_CONTENT_SIZE,
+        description="Maximum content characters to return per file",
+    )
+
+
+class FrontmatterUpdate(BaseModel):
+    """One typed frontmatter update."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., min_length=1, max_length=500)
+    fields: dict = Field(..., description="Frontmatter key-value pairs to merge")
+    expected_revision: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        description="Optional revision returned by vault_read; rejects stale updates",
+    )
 
 
 class VaultBatchFrontmatterUpdateInput(BaseModel):
@@ -242,19 +321,38 @@ class VaultBatchFrontmatterUpdateInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    updates: list[dict] = Field(
+    updates: list[FrontmatterUpdate] = Field(
         ...,
         description="List of updates, each a dict with 'path' (str) and 'fields' (dict of key-value pairs to set)",
         min_length=1,
         max_length=MAX_BATCH_SIZE,
     )
 
-    @field_validator("updates")
-    @classmethod
-    def validate_updates(cls, v: list[dict]) -> list[dict]:
-        for i, item in enumerate(v):
-            if "path" not in item or not isinstance(item["path"], str):
-                raise ValueError(f"updates[{i}] must contain a 'path' key with a string value")
-            if "fields" not in item or not isinstance(item["fields"], dict):
-                raise ValueError(f"updates[{i}] must contain a 'fields' key with a dict value")
-        return v
+
+class VaultRecentInput(BaseModel):
+    """Find recently changed or dated notes."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path_prefix: str | None = Field(default=None, max_length=500)
+    pattern: str = Field(default="*.md", max_length=100)
+    tag: str | None = Field(default=None, max_length=100)
+    limit: int = Field(default=10, ge=1, le=50)
+    sort_by: Literal["modified", "frontmatter_date"] = "modified"
+    date_field: str = Field(default="date", min_length=1, max_length=100)
+
+
+class VaultFindAndReadInput(BaseModel):
+    """Search and return matching note bodies in one request."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    query: str = Field(..., min_length=1, max_length=200)
+    path_prefix: str | None = Field(default=None, max_length=500)
+    max_files: int = Field(default=5, ge=1, le=20)
+    context_lines: int = Field(default=CONTEXT_LINES, ge=0, le=10)
+    max_chars_per_file: int = Field(default=4_000, ge=1, le=MAX_CONTENT_SIZE)
+    regex: bool = Field(
+        default=False,
+        description="If true, treat query as a regular expression instead of literal text",
+    )

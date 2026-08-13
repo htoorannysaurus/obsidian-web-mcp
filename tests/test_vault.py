@@ -1,7 +1,6 @@
 """Tests for vault.py -- path resolution, file operations, and safety checks."""
 
 import pytest
-from pathlib import Path
 
 from obsidian_vault_mcp.vault import (
     resolve_vault_path,
@@ -80,6 +79,7 @@ def test_write_atomic_creates_dirs(vault_dir):
 def test_write_respects_size_limit(vault_dir):
     """Content exceeding MAX_CONTENT_SIZE is rejected."""
     from obsidian_vault_mcp.config import MAX_CONTENT_SIZE
+
     big_content = "x" * (MAX_CONTENT_SIZE + 1)
     with pytest.raises(ValueError, match="size"):
         write_file_atomic("big-file.md", big_content)
@@ -98,11 +98,41 @@ def test_delete_moves_to_trash(vault_dir):
 
 def test_list_excludes_dotdirs(vault_dir):
     """Listing excludes .obsidian directory."""
-    items = list_directory("", depth=1, include_files=True, include_dirs=True, pattern=None)
+    items = list_directory(
+        "", depth=1, include_files=True, include_dirs=True, pattern=None
+    )
     names = [item["name"] for item in items]
     assert ".obsidian" not in names
     assert ".trash" not in names
+    assert ".claude" not in names
     assert "test-note.md" in names
+
+
+def test_list_does_not_follow_symlinked_directories(vault_dir, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "private.md").write_text("outside vault")
+    (vault_dir / "external").symlink_to(outside, target_is_directory=True)
+
+    items = list_directory("", depth=2)
+    paths = [item["path"] for item in items]
+    assert "external" not in paths
+    assert "external/private.md" not in paths
+
+
+def test_write_rejects_stale_revision(vault_dir):
+    from obsidian_vault_mcp.vault import content_revision
+
+    original = (vault_dir / "test-note.md").read_text()
+    revision = content_revision(original)
+    (vault_dir / "test-note.md").write_text("Changed elsewhere")
+
+    with pytest.raises(ValueError, match="Revision mismatch"):
+        write_file_atomic(
+            "test-note.md",
+            "Agent update",
+            expected_revision=revision,
+        )
 
 
 def test_move_file(vault_dir):

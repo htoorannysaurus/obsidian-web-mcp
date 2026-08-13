@@ -18,19 +18,21 @@ import hmac
 import logging
 import secrets
 import time
-from urllib.parse import urlencode, urlparse, parse_qs
+from urllib.parse import urlencode
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse
+from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Route
 
 from . import config
+from .tokens import issue_access_token
 
 logger = logging.getLogger(__name__)
 
 # In-memory store for authorization codes (short-lived)
 # Maps code -> {client_id, redirect_uri, code_challenge, code_challenge_method, expires_at}
 _auth_codes: dict[str, dict] = {}
+
 
 # Clean up expired codes periodically
 def _cleanup_codes():
@@ -43,16 +45,18 @@ def _cleanup_codes():
 async def oauth_metadata(request: Request) -> JSONResponse:
     """RFC 8414 OAuth authorization server metadata."""
     base_url = str(request.base_url).rstrip("/")
-    return JSONResponse({
-        "issuer": base_url,
-        "authorization_endpoint": f"{base_url}/oauth/authorize",
-        "token_endpoint": f"{base_url}/oauth/token",
-        "registration_endpoint": f"{base_url}/oauth/register",
-        "grant_types_supported": ["authorization_code"],
-        "response_types_supported": ["code"],
-        "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post"],
-    })
+    return JSONResponse(
+        {
+            "issuer": base_url,
+            "authorization_endpoint": f"{base_url}/oauth/authorize",
+            "token_endpoint": f"{base_url}/oauth/token",
+            "registration_endpoint": f"{base_url}/oauth/register",
+            "grant_types_supported": ["authorization_code"],
+            "response_types_supported": ["code"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        }
+    )
 
 
 async def oauth_authorize(request: Request):
@@ -67,13 +71,25 @@ async def oauth_authorize(request: Request):
     redirect_uri = request.query_params.get("redirect_uri", "")
     state = request.query_params.get("state", "")
     code_challenge = request.query_params.get("code_challenge", "")
-    code_challenge_method = request.query_params.get("code_challenge_method", "S256")
+    code_challenge_method = request.query_params.get("code_challenge_method", "")
 
     if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
 
     if not redirect_uri:
-        return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri required"}, status_code=400)
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "redirect_uri required"},
+            status_code=400,
+        )
+
+    if not code_challenge or code_challenge_method != "S256":
+        return JSONResponse(
+            {
+                "error": "invalid_request",
+                "error_description": "PKCE with code_challenge_method=S256 is required",
+            },
+            status_code=400,
+        )
 
     # Generate authorization code
     _cleanup_codes()
@@ -86,7 +102,9 @@ async def oauth_authorize(request: Request):
         "expires_at": time.time() + 300,  # 5 minute expiry
     }
 
-    logger.info(f"OAuth authorization code issued, redirecting to {redirect_uri[:50]}...")
+    logger.info(
+        f"OAuth authorization code issued, redirecting to {redirect_uri[:50]}..."
+    )
 
     # Redirect back to Claude with the code
     params = {"code": code}
@@ -111,11 +129,11 @@ async def oauth_token(request: Request) -> JSONResponse:
     client_id = form.get("client_id", "")
     client_secret = form.get("client_secret", "")
 
-    # Support both authorization_code and client_credentials grants
+    # Only the interactive authorization-code flow is allowed. Cloudflare
+    # Access protects /oauth/authorize, so accepting client_credentials here
+    # would provide a machine-only path around Joe's identity check.
     if grant_type == "authorization_code":
         return await _handle_authorization_code(form, client_id, client_secret)
-    elif grant_type == "client_credentials":
-        return await _handle_client_credentials(client_id, client_secret)
     else:
         return JSONResponse(
             {"error": "unsupported_grant_type"},
@@ -123,7 +141,9 @@ async def oauth_token(request: Request) -> JSONResponse:
         )
 
 
-async def _handle_authorization_code(form, client_id: str, client_secret: str) -> JSONResponse:
+async def _handle_authorization_code(
+    form, client_id: str, client_secret: str
+) -> JSONResponse:
     """Exchange an authorization code for a bearer token."""
     code = form.get("code", "")
     redirect_uri = form.get("redirect_uri", "")
@@ -132,53 +152,69 @@ async def _handle_authorization_code(form, client_id: str, client_secret: str) -
     _cleanup_codes()
 
     if code not in _auth_codes:
-        return JSONResponse({"error": "invalid_grant", "error_description": "Invalid or expired code"}, status_code=400)
+        return JSONResponse(
+            {"error": "invalid_grant", "error_description": "Invalid or expired code"},
+            status_code=400,
+        )
 
     code_data = _auth_codes.pop(code)
 
+    if client_id != code_data["client_id"]:
+        return JSONResponse(
+            {"error": "invalid_grant", "error_description": "client_id mismatch"},
+            status_code=400,
+        )
+
     # Verify redirect_uri matches
-    if redirect_uri and code_data["redirect_uri"] and redirect_uri != code_data["redirect_uri"]:
-        return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
+    if (
+        redirect_uri
+        and code_data["redirect_uri"]
+        and redirect_uri != code_data["redirect_uri"]
+    ):
+        return JSONResponse(
+            {"error": "invalid_grant", "error_description": "redirect_uri mismatch"},
+            status_code=400,
+        )
 
     # Verify PKCE code_challenge if one was provided during authorization
     if code_data["code_challenge"]:
         if not code_verifier:
-            return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier required"}, status_code=400)
+            return JSONResponse(
+                {
+                    "error": "invalid_grant",
+                    "error_description": "code_verifier required",
+                },
+                status_code=400,
+            )
 
         # S256: BASE64URL(SHA256(code_verifier)) must match code_challenge
         import base64
+
         digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-        computed_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        computed_challenge = (
+            base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        )
 
         if not hmac.compare_digest(computed_challenge, code_data["code_challenge"]):
-            return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
+            return JSONResponse(
+                {
+                    "error": "invalid_grant",
+                    "error_description": "PKCE verification failed",
+                },
+                status_code=400,
+            )
 
-    logger.info("OAuth token issued via authorization_code grant")
-    return JSONResponse({
-        "access_token": config.VAULT_MCP_TOKEN,
-        "token_type": "bearer",
-        "expires_in": 86400,
-    })
-
-
-async def _handle_client_credentials(client_id: str, client_secret: str) -> JSONResponse:
-    """Exchange client credentials for a bearer token."""
-    if not config.VAULT_OAUTH_CLIENT_SECRET:
+    if not config.VAULT_MCP_TOKEN:
         return JSONResponse({"error": "server_error"}, status_code=500)
 
-    id_match = hmac.compare_digest(client_id, config.VAULT_OAUTH_CLIENT_ID)
-    secret_match = hmac.compare_digest(client_secret, config.VAULT_OAUTH_CLIENT_SECRET)
-
-    if not (id_match and secret_match):
-        logger.warning(f"OAuth client_credentials failed (client_id={client_id!r})")
-        return JSONResponse({"error": "invalid_client"}, status_code=401)
-
-    logger.info("OAuth token issued via client_credentials grant")
-    return JSONResponse({
-        "access_token": config.VAULT_MCP_TOKEN,
-        "token_type": "bearer",
-        "expires_in": 86400,
-    })
+    logger.info("OAuth token issued via authorization_code grant")
+    return JSONResponse(
+        {
+            "access_token": issue_access_token(client_id),
+            "token_type": "bearer",
+            "expires_in": config.OAUTH_TOKEN_TTL,
+        }
+    )
 
 
 async def oauth_register(request: Request) -> JSONResponse:
@@ -195,15 +231,18 @@ async def oauth_register(request: Request) -> JSONResponse:
     # Generate a unique client_id for this registration
     client_id = f"vault-mcp-{secrets.token_hex(8)}"
 
-    return JSONResponse({
-        "client_id": client_id,
-        "client_secret": config.VAULT_OAUTH_CLIENT_SECRET,
-        "client_name": body.get("client_name", "Obsidian Vault MCP Client"),
-        "grant_types": ["authorization_code"],
-        "response_types": ["code"],
-        "redirect_uris": body.get("redirect_uris", []),
-        "token_endpoint_auth_method": "client_secret_post",
-    }, status_code=201)
+    return JSONResponse(
+        {
+            "client_id": client_id,
+            "client_secret": config.VAULT_OAUTH_CLIENT_SECRET,
+            "client_name": body.get("client_name", "Obsidian Vault MCP Client"),
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "redirect_uris": body.get("redirect_uris", []),
+            "token_endpoint_auth_method": "client_secret_post",
+        },
+        status_code=201,
+    )
 
 
 # Starlette routes to mount on the app

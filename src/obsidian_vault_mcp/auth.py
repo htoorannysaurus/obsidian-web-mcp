@@ -1,10 +1,13 @@
 """Bearer token authentication middleware for the vault MCP server."""
 
+import hmac
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .config import VAULT_MCP_TOKEN
+from .tokens import validate_access_token
 
 # Paths that don't require bearer auth (OAuth flow + health)
 _AUTH_EXEMPT_PATHS = {
@@ -37,7 +40,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header[7:]
-        if token != VAULT_MCP_TOKEN:
+        legacy_token = hmac.compare_digest(token, VAULT_MCP_TOKEN)
+        if not legacy_token and not validate_access_token(token):
             return JSONResponse(
                 {"error": "Invalid token"},
                 status_code=401,

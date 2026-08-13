@@ -1,7 +1,7 @@
 """Tests for frontmatter_index.py -- indexing, searching, and merging."""
 
 import pytest
-from pathlib import Path
+import time
 
 from obsidian_vault_mcp.frontmatter_index import FrontmatterIndex
 
@@ -46,10 +46,41 @@ def test_search_exists(index, vault_dir):
 
 def test_search_with_prefix(index, vault_dir):
     """Search limited to subfolder/."""
-    results = index.search_by_field("status", "draft", "exact", path_prefix="subfolder/")
+    results = index.search_by_field(
+        "status", "draft", "exact", path_prefix="subfolder/"
+    )
     assert len(results) >= 1
     for r in results:
         assert r["path"].startswith("subfolder/")
+
+
+def test_exact_match_supports_list_membership(index, vault_dir):
+    (vault_dir / "tagged.md").write_text("---\ntags: [tech, ai]\n---\n\nTagged.\n")
+    index._schedule_debounce(str(vault_dir / "tagged.md"))
+    index._flush_pending()
+    results = index.search_by_field("tags", "tech", "exact")
+    assert any(item["path"] == "tagged.md" for item in results)
+
+
+def test_index_tracks_file_moves(index, vault_dir, monkeypatch):
+    import obsidian_vault_mcp.config as config
+
+    monkeypatch.setattr(config, "FRONTMATTER_INDEX_DEBOUNCE", 0.01)
+    source = vault_dir / "test-note.md"
+    destination = vault_dir / "renamed-note.md"
+    source.rename(destination)
+
+    deadline = time.time() + 1
+    while time.time() < deadline:
+        if (
+            index.get("renamed-note.md") is not None
+            and index.get("test-note.md") is None
+        ):
+            break
+        time.sleep(0.02)
+
+    assert index.get("renamed-note.md") is not None
+    assert index.get("test-note.md") is None
 
 
 def test_frontmatter_merge(vault_dir):
